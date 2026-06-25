@@ -1,0 +1,194 @@
+import os
+import logging
+import psycopg
+from psycopg.connection import Connection
+
+from models.DataModels import Document, DocumentCreate, DocumentSearchResult
+from pgvector.psycopg import register_vector
+from google.genai import Client
+
+
+class MemoryController:
+    db_config: dict[str, str]
+
+    def __init__(self):
+        self.api_key: str | None = os.getenv("API_KEY")
+        host = os.getenv("PG_HOST")
+        port = os.getenv("PG_PORT")
+        dbname = os.getenv("PG_NAME")
+        user = os.getenv("PG_USER")
+        password = os.getenv("PG_PASS")
+
+        if not all([host, port, dbname, user, password]):
+            raise ValueError("Missing required values for database connection")
+
+        self.db_url = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+        self.embeded_dim = 768
+        self.client: Client = Client(api_key=self.api_key)
+
+        self._init_db()
+
+    def _connect(self, register=True):
+        conn = psycopg.connect(self.db_url)
+        if register:
+            register_vector(conn)
+        return conn
+
+    def _embed(self, text: str) -> list[float] | None:
+        res = self.client.models.embed_content(
+            model="text-embedding-004", contents=text
+        )
+
+        if res and res.embeddings:
+            return res.embeddings[0].values
+
+        return None
+
+    def _init_db(self):
+        with self._connect(register=False) as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+
+        with self._connect() as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                link TEXT,
+                hashtags TEXT[] DEFAULT '{}',
+                embedding vector(768),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                modified_at TIMESTAMPTZ DEFAULT NOW(),
+                posted BOOLEAN NOT NULL DEFAULT FALSE,
+                deleted BOOLEAN NOT NULL DEFAULT FALSE
+            )
+            """)
+            conn.commit()
+
+    def add(self, doc: DocumentCreate) -> Document | None:
+        embedding = self._embed(doc.text)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO documents (text, link, hashtags, embedding)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, text, link, hashtags, embedding, created_at, modified_at, posted, deleted
+                """,
+                (doc.text, doc.link, doc.hashtags, embedding),
+            ).fetchone()
+            conn.commit()
+            # print(f"rows:\n{row}")
+
+            if row:
+                return Document(
+                    id=row[0],
+                    text=row[1],
+                    link=row[2],
+                    hashtags=row[3],
+                    created_at=row[4],
+                    modified_at=row[5],
+                    embedding=row[6],
+                    posted=row[7],
+                    deleted=row[7],
+                )
+            return None
+
+    def update(self, doc_id: int, text: str) -> Document | None:
+        embedding = self._embed(text)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE documents 
+                SET text = %s, embedding = %s, modified_at = NOW()
+                WHERE id = %s
+                RETURNING id, text, embedding, created_at, modified_at
+                """,
+                (text, embedding, doc_id),
+            ).fetchone()
+            conn.commit()
+
+            if row:
+                return Document(
+                    id=row[0],
+                    text=row[1],
+                    link=row[2],
+                    hashtags=row[3],
+                    embedding=list(row[4]),
+                    created_at=row[5],
+                    modified_at=row[6],
+                )
+            return None
+
+    def search(self, query: str, limit: int = 5) -> list[DocumentSearchResult]:
+        embedding = self._embed(query)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, text, link, hashtags, created_at, modified_at, 1 - (embedding <=> %s::vector) AS similarity
+                FROM documents 
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (embedding, embedding, limit),
+            ).fetchall()
+            # if rows:
+            #     print(f"Columns per row: {len(rows[0])}")
+            #     print(f"First row: {rows[0]}")
+
+            return [
+                DocumentSearchResult(
+                    id=r[0],
+                    text=r[1],
+                    link=r[2],
+                    hashtags=r[3],
+                    created_at=r[4],
+                    modified_at=r[5],
+                    similarity=r[6],
+                )
+                for r in rows
+            ]
+
+    def get(self, doc_id: int) -> Document | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, text, embedding, created_at, modified_at FROM documents WHERE id = %s",
+                (doc_id,),
+            ).fetchone()
+            if row:
+                return Document(
+                    id=row[0],
+                    text=row[1],
+                    link=row[2],
+                    hashtags=row[3],
+                    embedding=list(row[4]),
+                    created_at=row[5],
+                    modified_at=row[6],
+                )
+            return None
+
+    def delete(self, doc_id: int) -> bool:
+        with self._connect() as conn:
+            result = conn.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+            conn.commit()
+            return result.rowcount > 0
+
+    def is_unique(self, text: str, threshold: float = 0.75) -> bool:
+        """
+        Returns True if unique enough
+        Example: 0.85 == 85% similarity
+        """
+
+        # print(text)
+        logging.info(f"Threshold Set to: {threshold}")
+        results = self.search(text, limit=1)
+
+        if not results:
+            logging.info("No similarities found")
+            return True
+
+        logging.info(f"Similarity Results Score: {results[0].similarity}")
+        print(f"Similarity Results Score: {results[0].similarity}")
+
+        verdict: bool = results[0].similarity < threshold
+        print(f"Final verdict on if it passes similarity checks: {verdict}")
+        return verdict
